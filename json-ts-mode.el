@@ -48,11 +48,11 @@
 
 (defconst json-ts-mode--grammar-sources
   '((json "https://github.com/konomanoasa/tree-sitter-json"
-          :revision "v0.2.0")
+          :revision "v0.2.1")
     (jsonc "https://github.com/konomanoasa/tree-sitter-json"
-           :revision "v0.2.0" :source-dir "jsonc/src")
+           :revision "v0.2.1" :source-dir "jsonc/src")
     (jsonc_trailing "https://github.com/konomanoasa/tree-sitter-json"
-                    :revision "v0.2.0" :source-dir "jsonc_trailing/src"))
+                    :revision "v0.2.1" :source-dir "jsonc_trailing/src"))
   "Tree-sitter grammar sources for JSON and JSONC.")
 
 (defconst json-ts-mode--file-name-languages
@@ -88,23 +88,107 @@
       ("jsonc_trailing" 'jsonc_trailing)
       (_ (user-error "Invalid EditorConfig json_dialect: %S" dialect)))))
 
-(defun json-ts-mode--after-change (beg _end old-length)
-  "Reparse a BOM moved to the start by an edit at BEG of OLD-LENGTH."
-  (when (and (= beg 1) (> old-length 0))
+;;;; Incremental Updates
+
+(defconst json-ts-mode-update--containers
+  '("value" "object" "array")
+  "Container nodes traversed to find an edited source unit.")
+
+(defvar-local json-ts-mode-update--state nil
+  "Bounds and recovery state captured before a buffer edit.")
+
+(defvar-local json-ts-mode-update--pending-range nil
+  "Edited owner range awaiting syntax propertization.")
+
+(defun json-ts-mode-update--bounds (beg end)
+  "Return enclosing source-unit bounds around BEG and END."
+  (let ((start beg)
+        (finish end)
+        (root (treesit-parser-root-node treesit-primary-parser)))
+    (dolist (position (list (max (point-min) (1- beg))
+                            (min (point-max) end)))
+      (let ((node (treesit-node-at position treesit-primary-parser))
+            owner)
+        (while (and node (not (treesit-node-eq node root)))
+          (unless (member (treesit-node-type node)
+                          json-ts-mode-update--containers)
+            (setq owner node))
+          (setq node (treesit-node-parent node)))
+        (when owner
+          (setq start (min start (treesit-node-start owner))
+                finish (max finish (treesit-node-end owner))))))
+    (cons start finish)))
+
+(defun json-ts-mode-update--before-change (beg end)
+  "Save owner bounds and old-tree recovery state before changing BEG to END."
+  (when treesit-primary-parser
     (save-restriction
       (widen)
-      (when (eq (char-after 1) #xfeff)
-        (let* ((parser treesit-primary-parser)
-               (language (treesit-parser-language parser))
-               (notifiers (treesit-parser-notifiers parser))
-               (level (treesit-parser-embed-level parser)))
-          (treesit-parser-delete parser)
-          (setq treesit-primary-parser (treesit-parser-create language))
-          (treesit-parser-set-embed-level treesit-primary-parser level)
-          (dolist (notifier notifiers)
-            (treesit-parser-add-notifier treesit-primary-parser notifier))
-          (syntax-ppss-flush-cache 1)
-          (font-lock-flush))))))
+      (setq json-ts-mode-update--state
+            (cons (json-ts-mode-update--bounds beg end)
+                  (treesit-node-check
+                   (treesit-parser-root-node treesit-primary-parser)
+                   'has-error))))))
+
+(defun json-ts-mode-update--reset-parser ()
+  "Replace the primary parser without reusing its old tree."
+  (let* ((parser treesit-primary-parser)
+         (language (treesit-parser-language parser))
+         (tag (treesit-parser-tag parser))
+         (ranges (treesit-parser-included-ranges parser))
+         (notifiers (treesit-parser-notifiers parser))
+         (level (treesit-parser-embed-level parser)))
+    (treesit-parser-delete parser)
+    (setq treesit-primary-parser (treesit-parser-create language nil nil tag))
+    (treesit-parser-set-included-ranges treesit-primary-parser ranges)
+    (treesit-parser-set-embed-level treesit-primary-parser level)
+    (dolist (notifier notifiers)
+      (treesit-parser-add-notifier treesit-primary-parser notifier))))
+
+(defun json-ts-mode-update--after-change (beg end old-length)
+  "Refresh edited owners and avoid stale trees after BEG, END and OLD-LENGTH."
+  (when treesit-primary-parser
+    (let ((narrowed (buffer-narrowed-p)))
+      (save-restriction
+        (widen)
+        (let* ((state json-ts-mode-update--state)
+               (reset (or (cdr state)
+                          (and (= beg 1) (> old-length 0)
+                               (eq (char-after 1) #xfeff)))))
+          (setq json-ts-mode-update--state nil)
+          (when reset (json-ts-mode-update--reset-parser))
+          (let* ((bounds (if reset (cons (point-min) (point-max))
+                           (json-ts-mode-update--bounds beg end)))
+                 (start (min (car bounds) (or (caar state) beg)))
+                 (finish (min (point-max)
+                              (max (cdr bounds)
+                                   (+ (or (cdar state) (+ beg old-length))
+                                      (- end beg old-length)))))
+                 (pending json-ts-mode-update--pending-range)
+                 (pending-end (cdr pending)))
+            (when (and pending-end (>= pending-end beg))
+              (setq pending-end (max end (+ pending-end (- end beg old-length)))))
+            (setq json-ts-mode-update--pending-range
+                  (cons (min start (or (car pending) start))
+                        (min (point-max) (max finish (or pending-end finish)))))
+            (syntax-ppss-flush-cache start)
+            (font-lock-flush start finish)
+            (when narrowed (syntax-propertize finish))))))))
+
+(defun json-ts-mode-update--extend-region (start end)
+  "Include edited owners when propertizing START to END."
+  (when json-ts-mode-update--pending-range
+    (let ((bounds json-ts-mode-update--pending-range))
+      (setq json-ts-mode-update--pending-range nil)
+      (cons (max (point-min) (min start (car bounds)))
+            (min (point-max) (max end (cdr bounds)))))))
+
+(defun json-ts-mode-update--setup ()
+  "Configure incremental updates for the current buffer."
+  (add-hook 'before-change-functions #'json-ts-mode-update--before-change nil t)
+  (add-hook 'after-change-functions #'json-ts-mode-update--after-change nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'json-ts-mode-update--extend-region nil t))
 
 ;;;; Syntax
 
@@ -309,16 +393,7 @@
     (setq-local electric-pair-open-newline-between-pairs
                 (lambda ()
                   (and (if (functionp setting) (funcall setting) setting)
-                       (json-ts-mode-electric-pair--newline-context-p)))))
-  (let ((predicate electric-pair-inhibit-predicate))
-    (setq-local electric-pair-inhibit-predicate
-                (lambda (character)
-                  (or (save-restriction
-                        (widen)
-                        (treesit-parent-until
-                         (treesit-node-at (1- (point)) treesit-primary-parser)
-                         "^\\(?:single_line_comment\\|multi_line_comment\\)$" t))
-                      (and predicate (funcall predicate character)))))))
+                       (json-ts-mode-electric-pair--newline-context-p))))))
 
 ;;;; Font Lock
 
@@ -508,7 +583,7 @@
   (json-ts-mode-imenu--setup)
   (json-ts-mode-indent--setup)
   (treesit-major-mode-setup)
-  (add-hook 'after-change-functions #'json-ts-mode--after-change nil t))
+  (json-ts-mode-update--setup))
 
 ;;;###autoload
 (define-derived-mode json-ts-mode prog-mode "JSON-TS"

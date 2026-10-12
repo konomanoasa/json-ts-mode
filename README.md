@@ -41,9 +41,9 @@ Supports `treesit-font-lock-level`.
 | 3     | Numbers and escapes                   |
 | 4     | Delimiters, punctuation, and brackets |
 
-## JSON Dialect
+## Parsing Conditions
 
-Select the dialect for matching files in `.editorconfig`.
+Set parsing conditions for matching files in `.editorconfig`.
 
 ```ini
 [config.json]
@@ -59,6 +59,7 @@ json_dialect = jsonc_trailing
 Without `json_dialect`, `tsconfig.json` and `jsconfig.json` use
 `jsonc_trailing`, `.jsonc` files use `jsonc`, and other files or unnamed
 buffers use `json`.
+Restart the mode to apply changes.
 
 ## Grammar
 

@@ -34,6 +34,22 @@
 
 ;;;; Helpers
 
+(defmacro json-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "json-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (json-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
 (defmacro json-ts-mode-test--with-directory (&rest body)
   "Evaluate BODY in an isolated EditorConfig directory."
   (declare (indent 0) (debug (body)))
@@ -99,17 +115,22 @@
                     (nth 4 (syntax-ppss position))) state)))
     (nreverse state)))
 
-(defun json-ts-mode-test--should-match-fresh-buffer ()
-  "Compare current classifications against a fresh buffer."
+(defun json-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (json-ts-mode-test--buffer-state))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
         (file buffer-file-name)
-        (level treesit-font-lock-level))
+        (level (or level treesit-font-lock-level)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (json-ts-mode))
-      (should (equal state (json-ts-mode-test--buffer-state))))))
+      (should (equal state (json-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -446,24 +467,6 @@
           (should (= (point) (1- (point-max)))))))
     (should (equal electric-pair-pairs '((?% . ?%) (?\[ . ?!))))))
 
-(ert-deftest json-ts-mode-does-not-pair-in-comments-and-preserves-inhibit-predicate ()
-  (dolist (language '(jsonc jsonc_trailing))
-    (dolist (source '("// note " "/* note  */"))
-      (dolist (character '(?{ ?\[ ?\"))
-        (json-ts-mode-test--with-source language source
-          (electric-pair-local-mode 1)
-          (goto-char (+ (json-ts-mode-test--position "note ") 5))
-          (let ((before (buffer-size)) (last-command-event character))
-            (self-insert-command 1)
-            (should (= (buffer-size) (1+ before))))))))
-  (let* ((calls nil)
-         (electric-pair-inhibit-predicate (lambda (character) (push character calls) t)))
-    (json-ts-mode-test--with-source 'json ""
-      (electric-pair-local-mode 1)
-      (let ((last-command-event ?{)) (self-insert-command 1))
-      (should (equal (buffer-substring-no-properties (point-min) (point-max)) "{"))
-      (should (equal calls '(?{))))))
-
 (ert-deftest json-ts-mode-pairs-quotes-and-skips-the-inserted-closing-quote ()
   (dolist (language '(json jsonc jsonc_trailing))
     (json-ts-mode-test--with-source language "{"
@@ -532,17 +535,6 @@
     (should (equal electric-pair-pairs '((?\[ . ?\]) (?{ . ?}) (?\" . ?\"))))
     (should-not electric-pair-open-newline-between-pairs)))
 
-(ert-deftest json-ts-mode-inhibits-pairing-in-a-narrowed-comment-body ()
-  (dolist (language '(jsonc jsonc_trailing))
-    (json-ts-mode-test--with-source language "/* head\nbody\n*/"
-      (electric-pair-local-mode 1)
-      (narrow-to-region (json-ts-mode-test--position "body")
-                        (json-ts-mode-test--position "*/"))
-      (goto-char (point-min))
-      (let ((before (buffer-size)) (last-command-event ?{))
-        (self-insert-command 1)
-        (should (= (buffer-size) (1+ before)))))))
-
 (ert-deftest json-ts-mode-does-not-match-or-expand-brackets-in-a-narrowed-comment ()
   (let ((electric-pair-open-newline-between-pairs t))
     (dolist (language '(jsonc jsonc_trailing))
@@ -604,6 +596,22 @@
                          ("\\u12z" 4 nil) ("true,," 4 font-lock-punctuation-face)
                          ("bad" 0 nil) (" tru" 1 nil)))
           (should (eq (json-ts-mode-test--face fragment offset) face)))))))
+
+(ert-deftest json-ts-mode-preserves-members-around-recovery ()
+  (let ((treesit-font-lock-level 4))
+    (pcase-dolist (`(,language ,source ,fragment ,face ,names ,old ,new)
+                   '((json "{\"a\":1]\"b\":2}" "b" font-lock-property-name-face
+                           ("\"a\"" "\"b\"") "]" ",")
+                     (jsonc "{\"a\": /* note */}" "note" font-lock-comment-face
+                            ("\"a\"") "}" "1}")))
+      (json-ts-mode-test--with-source language source
+                                      (font-lock-ensure)
+                                      (should (eq (json-ts-mode-test--face fragment) face))
+                                      (should (equal (mapcar #'car (cdar (funcall imenu-create-index-function))) names))
+                                      (goto-char (json-ts-mode-test--position old))
+                                      (delete-char (length old))
+                                      (insert new)
+                                      (json-ts-mode-test--should-match-fresh-buffer)))))
 
 (ert-deftest json-ts-mode-font-lock-captures-only-real-leaves ()
   (dolist (language '(json jsonc jsonc_trailing))
@@ -761,6 +769,32 @@
 
 ;;;; Updates
 
+(ert-deftest json-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((json "test.json" "json_dialect = json\n" "{\n\"a\": 1\n}\n" "1" 3)
+                   (jsonc "test.json" "json_dialect = jsonc\n" "{\n\"a\": 1\n}\n" "1" 3)
+                   (jsonc_trailing "test.json" "json_dialect = jsonc_trailing\n" "{\n\"a\": 1\n}\n" "1" 3)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (json-ts-mode-test--with-file file properties source
+                                        (rename-buffer "json-ts-mode-test" t)
+                                        (let ((noninteractive nil)) (font-lock-mode 1))
+                                        (json-ts-mode-test--buffer-state)
+                                        (should (get-text-property owner-start 'fontified))
+                                        (let ((parser treesit-primary-parser))
+                                          (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                          (dolist (notifier (treesit-parser-notifiers parser))
+                                            (treesit-parser-remove-notifier parser notifier))
+                                          (goto-char (json-ts-mode-test--position fragment))
+                                          (when narrow
+                                            (narrow-to-region (line-beginning-position) (line-end-position)))
+                                          (insert "2")
+                                          (widen)
+                                          (should (eq parser treesit-primary-parser))
+                                          (should-not (get-text-property owner-start 'fontified))
+                                          (json-ts-mode-test--should-match-fresh-buffer 4 t))))))))
+
 (ert-deftest json-ts-mode-reparses-a-bom-moved-to-buffer-start ()
   (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
                  '((json "test.json" "json_dialect = json\n" "[]\n" "[1]\n" "1" font-lock-number-face)
@@ -768,41 +802,22 @@
                    (jsonc_trailing "test.json" "json_dialect = jsonc_trailing\n" "[]\n" "[1]\n" "1" font-lock-number-face)))
     (dolist (narrow '(nil t))
       (ert-info ((format "%s, narrowed: %s" language narrow))
-        (let ((default-directory
-               (file-name-as-directory (make-temp-file "json-ts-mode-" t))))
-          (unwind-protect
-              (progn
-                (with-temp-file (expand-file-name ".editorconfig")
-                  (insert "root = true\n[*]\n" properties))
-                (with-temp-buffer
-                  (setq buffer-file-name (expand-file-name file))
-                  (insert prefix "\ufeff" body)
-                  (let ((treesit-font-lock-level 4)) (json-ts-mode))
-                  (json-ts-mode-test--buffer-state)
-                  (when narrow
-                    (narrow-to-region 1 (+ 2 (length prefix))))
-                  (delete-region 1 (1+ (length prefix)))
-                  (widen)
-                  (should (eq (treesit-parser-language treesit-primary-parser) language))
-                  (should (equal (treesit-parser-list) (list treesit-primary-parser)))
-                  (let ((state (json-ts-mode-test--buffer-state))
-                        (tree (treesit-node-string
-                               (treesit-parser-root-node treesit-primary-parser)))
-                        (source (buffer-substring-no-properties (point-min) (point-max)))
-                        (filename buffer-file-name))
-                    (should (equal source (concat "\ufeff" body)))
-                    (should-not (get-text-property 1 'face))
-                    (goto-char (point-min))
-                    (search-forward fragment)
-                    (should (eq (get-text-property (1- (point)) 'face) face))
-                    (with-temp-buffer
-                      (setq buffer-file-name filename)
-                      (insert source)
-                      (let ((treesit-font-lock-level 4)) (json-ts-mode))
-                      (should (equal state (json-ts-mode-test--buffer-state)))
-                      (should (equal tree (treesit-node-string
-                                           (treesit-parser-root-node treesit-primary-parser))))))))
-            (delete-directory default-directory t)))))))
+        (let ((treesit-font-lock-level 4))
+          (json-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+                                        (json-ts-mode-test--buffer-state)
+                                        (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+                                        (delete-region 1 (1+ (length prefix)))
+                                        (widen)
+                                        (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                        (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                                        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                                                       (concat "\ufeff" body)))
+                                        (json-ts-mode-test--buffer-state)
+                                        (should-not (get-text-property 1 'face))
+                                        (goto-char (point-min))
+                                        (search-forward fragment)
+                                        (should (eq (get-text-property (1- (point)) 'face) face))
+                                        (json-ts-mode-test--should-match-fresh-buffer 4 t)))))))
 
 (ert-deftest json-ts-mode-updates-font-lock-and-syntax-like-a-fresh-buffer ()
   (let ((treesit-font-lock-level 4))
