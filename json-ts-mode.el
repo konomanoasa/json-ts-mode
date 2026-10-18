@@ -48,11 +48,11 @@
 
 (defconst json-ts-mode--grammar-sources
   '((json "https://github.com/konomanoasa/tree-sitter-json"
-          :revision "v0.2.1")
+          :revision "v0.2.2")
     (jsonc "https://github.com/konomanoasa/tree-sitter-json"
-           :revision "v0.2.1" :source-dir "jsonc/src")
+           :revision "v0.2.2" :source-dir "jsonc/src")
     (jsonc_trailing "https://github.com/konomanoasa/tree-sitter-json"
-                    :revision "v0.2.1" :source-dir "jsonc_trailing/src"))
+                    :revision "v0.2.2" :source-dir "jsonc_trailing/src"))
   "Tree-sitter grammar sources for JSON and JSONC.")
 
 (defconst json-ts-mode--file-name-languages
